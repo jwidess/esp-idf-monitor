@@ -22,6 +22,7 @@ from typing import Tuple
 import pytest
 
 from esp_idf_monitor.base.binlog import BinaryLog
+from esp_idf_monitor.base.logger import Logger
 
 from .conftest import out_dir
 
@@ -926,3 +927,30 @@ class TestEmbeddedMonitorCommands:
         assert argv == ['espefuse', '--token', 'EFSR:esp32c3:100:AAABBB', 'summary', '--active']
         assert call['shell'] is False
         assert logger.outputs == [b'OK\n']
+
+
+class TestLogger:
+    class _DummyConsole:
+        """Minimal stand-in for serial.tools.miniterm.Console (stored on Logger, unused in these checks)."""
+
+        pass
+
+    def test_disable_address_decoding_no_attribute_error(self):
+        """With --disable-address-decoding, Logger must still expose pc_address_decoder=None."""
+        logger = Logger(
+            elf_files=['/nonexistent/example.elf'],
+            console=self._DummyConsole(),
+            timestamps=False,
+            timestamp_format='',
+            enable_address_decoding=False,
+            toolchain_prefix='riscv32-esp-elf-',
+        )
+        assert logger.pc_address_decoder is None
+
+        # SerialHandler always calls this when an ELF path was passed; must not raise AttributeError
+        logger.handle_possible_pc_address_in_line(b'abort() was called at PC 0x420061ad on core 0\n')
+        logger.handle_possible_pc_address_in_line(b'PC      : 0x40080123\n')
+
+        assert logger.pc_address_buffer == b''
+        logger.pc_address_buffer = b'suffix'
+        assert logger.pc_address_buffer == b''

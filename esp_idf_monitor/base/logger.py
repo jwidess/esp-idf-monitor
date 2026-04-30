@@ -45,6 +45,7 @@ class Logger:
         self.console = console
         self.timestamps = timestamps
         self.timestamp_format = timestamp_format
+        self.pc_address_decoder = None  # always set; SerialHandler may call handlers when ELF exists but decoding off
         if enable_address_decoding:
             self.pc_address_decoder = PcAddressDecoder(toolchain_prefix, elf_files, rom_elf_file)
 
