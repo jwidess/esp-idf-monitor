@@ -29,7 +29,7 @@ from .conftest import out_dir
 if os.name != 'nt':
     import pty
 
-HOST = 'localhost'
+HOST = '127.0.0.1'
 
 IN_DIR = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'inputs')  # input files for tests
 EXIT_KEY = b'\x1d\n'  # CTRL+]
@@ -219,7 +219,9 @@ class TestHost(TestBaseClass):
         s.close()
         cmd = ' '.join(['esp_rfc2217_server.py', '-p', rfc2217_port, f'socket://{HOST}:{self.port}?logging=debug'])
         p = subprocess.Popen(cmd, shell=True)
-        yield f'rfc2217://localhost:{rfc2217_port}?ign_set_control'
+        # wait for the server to start
+        time.sleep(1)
+        yield f'rfc2217://{HOST}:{rfc2217_port}?ign_set_control'
         p.terminate()
 
     # fmt: off
