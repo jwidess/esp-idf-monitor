@@ -25,10 +25,13 @@ import os
 import queue
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
 import time
+from types import FrameType  # noqa: F401
+from typing import Callable  # noqa: F401
 from typing import List  # noqa: F401
 from typing import NoReturn  # noqa: F401
 from typing import Optional  # noqa: F401
@@ -44,6 +47,7 @@ from esp_idf_monitor import __version__
 # Windows console stuff
 from esp_idf_monitor.base.ansi_color_converter import get_ansi_converter
 from esp_idf_monitor.base.argument_parser import get_parser
+from esp_idf_monitor.base.command_reader import CommandReader
 from esp_idf_monitor.base.console_parser import ConsoleParser
 from esp_idf_monitor.base.console_reader import ConsoleReader
 from esp_idf_monitor.base.constants import CTRL_C
@@ -85,6 +89,7 @@ from esp_idf_monitor.base.serial_handler import run_make
 from esp_idf_monitor.base.serial_reader import LinuxReader  # noqa: F401
 from esp_idf_monitor.base.serial_reader import Reader  # noqa: F401
 from esp_idf_monitor.base.serial_reader import SerialReader  # noqa: F401
+from esp_idf_monitor.base.stoppable_thread import StoppableThread  # noqa: F401
 from esp_idf_monitor.base.web_socket_client import WebSocketClient
 from esp_idf_monitor.config import Config
 
@@ -122,10 +127,15 @@ class Monitor:
         force_color=False,  # type: bool
         disable_auto_color=False,  # type: bool
         rom_elf_file=None,  # type: Optional[str]
+        non_interactive=False,  # type: bool
     ):
         self.event_queue = queue.Queue()  # type: queue.Queue
         self.cmd_queue = queue.Queue()  # type: queue.Queue
-        self.console = miniterm.Console()
+        self.non_interactive = non_interactive
+        # ConsoleBase writes to stdout but never touches the TTY, so it is safe
+        # to use when stdin is not attached to a terminal (pipe, file, CI).
+        # The Console subclass requires a real TTY on construction.
+        self.console = miniterm.ConsoleBase() if non_interactive else miniterm.Console()
         # if the variable is set ANSI will be printed even if we do not print to terminal
         sys.stderr = get_ansi_converter(sys.stderr, force_color=force_color)  # type: ignore
         self.console.output = get_ansi_converter(self.console.output, force_color=force_color)
@@ -189,6 +199,20 @@ class Monitor:
 
             self.gdb_helper = None
 
+        self.console_parser = ConsoleParser(eol)
+        if non_interactive:
+            # Without a TTY on stdin, keys cannot be read; read line-based
+            # commands from stdin instead, so the monitor can be scripted.
+            command_reader = CommandReader(self.event_queue, self.console_parser)
+            self.console_reader = command_reader  # type: StoppableThread
+            # feed every decoded serial line to the reader for the 'expect' command
+            line_observer = command_reader.observe_line  # type: Optional[Callable[[str], None]]
+        else:
+            self.console_reader = ConsoleReader(
+                self.console, self.event_queue, self.cmd_queue, self.console_parser, socket_test_mode
+            )
+            line_observer = None
+
         cls = SerialHandler if self.elf_exists else SerialHandlerNoElf
         self.serial_handler = cls(
             b'',
@@ -205,22 +229,24 @@ class Monitor:
             self.elf_files,
             toolchain_prefix,
             disable_auto_color,
-        )
-
-        self.console_parser = ConsoleParser(eol)
-        self.console_reader = ConsoleReader(
-            self.console, self.event_queue, self.cmd_queue, self.console_parser, socket_test_mode
+            line_observer=line_observer,
         )
 
         self._line_matcher = LineMatcher(print_filter)
 
         # internal state
         self._invoke_processing_last_line_timer = None  # type: Optional[threading.Timer]
+        self._gdb_stub_warned = False
 
     def __enter__(self) -> None:
         """Use 'with self' to temporarily disable monitoring behaviour"""
         self.serial_reader.stop()
-        self.console_reader.stop()
+        if not self.non_interactive:
+            # The CommandReader is left running: it cannot be restarted while
+            # it is blocked in readline() and it does not touch the TTY, so
+            # there is no need to suspend it. Commands read meanwhile are
+            # queued and executed once the main loop resumes.
+            self.console_reader.stop()
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore
         raise NotImplementedError
@@ -238,7 +264,14 @@ class Monitor:
     def run_make(self, target: str) -> None:
         with self:
             run_make(
-                target, self.make, self.console, self.console_parser, self.event_queue, self.cmd_queue, self.logger
+                target,
+                self.make,
+                self.console,
+                self.console_parser,
+                self.event_queue,
+                self.cmd_queue,
+                self.logger,
+                non_interactive=self.non_interactive,
             )
 
     def _pre_start(self) -> None:
@@ -246,6 +279,15 @@ class Monitor:
         self.serial_reader.start()
 
     def main_loop(self) -> None:
+        if self.non_interactive:
+            # SIGTERM is how Docker/CI stop processes; reuse the Ctrl+C
+            # (KeyboardInterrupt) clean-shutdown path so the log file is
+            # flushed and closed. The default action would kill the process
+            # without running any cleanup.
+            def _sigterm_handler(signum: int, frame: Optional[FrameType]) -> None:
+                raise KeyboardInterrupt
+
+            signal.signal(signal.SIGTERM, _sigterm_handler)
         self._pre_start()
 
         try:
@@ -253,6 +295,9 @@ class Monitor:
                 try:
                     self._main_loop()
                 except KeyboardInterrupt:
+                    if self.non_interactive:
+                        # there is no exit key without a TTY, Ctrl+C exits
+                        break
                     note_print(
                         f'To exit from IDF monitor please use "{key_description(EXIT_KEY)}". Alternatively, '
                         f'you can use {key_description(MENU_KEY)} {key_description(EXIT_MENU_KEY)} to exit.'
@@ -339,7 +384,9 @@ class Monitor:
 class SerialMonitor(Monitor):
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore
         """Use 'with self' to temporarily disable monitoring behaviour"""
-        self.console_reader.start()
+        if not self.non_interactive:
+            # the CommandReader was not stopped in __enter__
+            self.console_reader.start()
         if self.elf_exists:
             self.serial_reader.gdb_exit = self.gdb_helper.gdb_exit  # type: ignore # write gdb_exit flag
         self.serial_reader.start()
@@ -370,6 +417,15 @@ class SerialMonitor(Monitor):
 
     def check_gdb_stub_and_run(self, line: bytes) -> None:  # type: ignore # The base class one is a None value
         if self.gdb_helper and self.gdb_helper.check_gdb_stub_trigger(line):
+            if self.non_interactive:
+                # gdb would read from the same stdin as the CommandReader and
+                # there is no terminal for an interactive session anyway
+                if not self._gdb_stub_warned:
+                    warning_print(
+                        'GDB stub detected, but an interactive GDB session cannot be started in non-interactive mode'
+                    )
+                    self._gdb_stub_warned = True
+                return
             with self:  # disable console control
                 self.gdb_helper.run_gdb()
 
@@ -387,7 +443,9 @@ class SerialMonitor(Monitor):
 class LinuxMonitor(Monitor):
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore
         """Use 'with self' to temporarily disable monitoring behaviour"""
-        self.console_reader.start()
+        if not self.non_interactive:
+            # the CommandReader was not stopped in __enter__
+            self.console_reader.start()
         self.serial_reader.start()
 
     def serial_write(self, *args: bytes, **kwargs: str) -> None:
@@ -423,8 +481,10 @@ def main() -> None:
     parser = get_parser()
     args = parser.parse_args()
 
-    if not sys.stdin.isatty() and not os.environ.get('ESP_IDF_MONITOR_TEST'):
-        sys.exit('Error: Monitor requires standard input to be attached to TTY. Try using a different terminal.')
+    # Without a TTY on stdin (pipe, file, CI) interactive key reading is not
+    # possible; switch to the non-interactive mode, where line-based commands
+    # are read from stdin instead (see CommandReader).
+    non_interactive = not sys.stdin.isatty() and not os.environ.get('ESP_IDF_MONITOR_TEST')
 
     # use EOL from argument; defaults to LF for Linux targets and CR otherwise
     args.eol = args.eol or ('LF' if args.target == 'linux' else 'CR')
@@ -512,16 +572,25 @@ def main() -> None:
             args.force_color,
             args.disable_auto_color,
             rom_elf_file,
+            non_interactive,
         )
 
         if args.save_log:
             monitor.logger.start_logging()
 
-        note_print(
-            'Quit: {q} | Menu: {m} | Help: {m} followed by {h}'.format(
-                q=key_description(EXIT_KEY), m=key_description(MENU_KEY), h=key_description(CTRL_H)
+        if non_interactive:
+            extras = ['send <text>', 'sleep <seconds>', 'expect <regex>', 'exit']
+            note_print(
+                'Standard input is not a TTY, running in non-interactive mode. Reading commands '
+                f'from stdin: {", ".join(list(CommandReader.COMMANDS) + extras)} '
+                "| Quit: 'exit' command, EOF or Ctrl+C"
             )
-        )
+        else:
+            note_print(
+                'Quit: {q} | Menu: {m} | Help: {m} followed by {h}'.format(
+                    q=key_description(EXIT_KEY), m=key_description(MENU_KEY), h=key_description(CTRL_H)
+                )
+            )
 
         if args.print_filter != DEFAULT_PRINT_FILTER:
             msg = ''

@@ -19,7 +19,6 @@ from .binlog import BinaryLog
 from .console_parser import ConsoleParser  # noqa: F401
 from .console_parser import key_description  # noqa: F401
 from .console_parser import prompt_next_action  # noqa: F401
-from .console_reader import ConsoleReader  # noqa: F401
 from .constants import CMD_APP_FLASH
 from .constants import CMD_ENTER_BOOT
 from .constants import CMD_MAKE
@@ -50,10 +49,12 @@ from .output_helpers import ANSI_NORMAL_B
 from .output_helpers import ANSI_RED_B
 from .output_helpers import ANSI_YELLOW_B
 from .output_helpers import AUTO_COLOR_REGEX
+from .output_helpers import error_print
 from .output_helpers import note_print
 from .output_helpers import warning_print
 from .reset import Reset
 from .serial_reader import Reader  # noqa: F401
+from .stoppable_thread import StoppableThread  # noqa: F401
 
 
 def get_sha256(filename, block_size=65536):  # type: (str, int) -> str
@@ -64,8 +65,8 @@ def get_sha256(filename, block_size=65536):  # type: (str, int) -> str
     return sha256.hexdigest()
 
 
-def run_make(target, make, console, console_parser, event_queue, cmd_queue, logger):
-    # type: (str, Union[str, List[str]], miniterm.Console, ConsoleParser, queue.Queue, queue.Queue, Logger) -> None
+def run_make(target, make, console, console_parser, event_queue, cmd_queue, logger, non_interactive=False):
+    # type: (str, Union[str, List[str]], miniterm.Console, ConsoleParser, queue.Queue, queue.Queue, Logger, bool) -> None
     if isinstance(make, list):
         popen_args = make + [target]
     else:
@@ -77,7 +78,11 @@ def run_make(target, make, console, console_parser, event_queue, cmd_queue, logg
     except KeyboardInterrupt:
         p.wait()
     if p.returncode != 0:
-        prompt_next_action('Build failed', console, console_parser, event_queue, cmd_queue)
+        if non_interactive:
+            # cannot prompt for the next action without a TTY on stdin
+            error_print('Build failed')
+        else:
+            prompt_next_action('Build failed', console, console_parser, event_queue, cmd_queue)
     else:
         logger.output_enabled = True
 
@@ -103,8 +108,9 @@ class SerialHandler:
         elf_files,
         toolchain_prefix,
         disable_auto_color,
+        line_observer=None,
     ):
-        # type: (bytes, bool, Logger, str, int, bytes, str, bool, bool, serial.Serial, bool, List[str], str, bool) -> None
+        # type: (bytes, bool, Logger, str, int, bytes, str, bool, bool, serial.Serial, bool, List[str], str, bool, Optional[Callable[[str], None]]) -> None
         self._last_line_part = last_line_part
         self._serial_check_exit = serial_check_exit
         self.logger = logger
@@ -125,6 +131,13 @@ class SerialHandler:
         self.binlog = BinaryLog(elf_files)
         self.binary_log_detected = False
         self.monitor_cmd_executor = SecureMonitorCommandExecutor(self.logger)
+        # called with every decoded line (even when filtered out by the print
+        # filter), used e.g. by the CommandReader 'expect' command
+        self._line_observer = line_observer
+
+    def _observe_line(self, line):  # type: (Union[bytes, str]) -> None
+        if self._line_observer is not None:
+            self._line_observer(line.decode(errors='ignore') if isinstance(line, bytes) else line)
 
     def splitdata(self, data):  # type: (bytes) -> List[bytes]
         """
@@ -209,6 +222,7 @@ class SerialHandler:
                 self.print_colored(line)
                 self.logger.handle_possible_pc_address_in_line(line)
                 self.monitor_cmd_executor.execute_from_log_line(line)
+                self._observe_line(line)
             if leaked_text:
                 leaked_lines = leaked_text.splitlines(keepends=True) or [b'']
                 if leaked_lines and not (leaked_lines[-1].endswith(b'\n') or leaked_lines[-1].endswith(b'\r')):
@@ -219,6 +233,7 @@ class SerialHandler:
                     self.print_colored(line)
                     self.logger.handle_possible_pc_address_in_line(line)
                     self.monitor_cmd_executor.execute_from_log_line(line)
+                    self._observe_line(line)
             return
 
         for line in sp:
@@ -247,6 +262,7 @@ class SerialHandler:
                     self.monitor_cmd_executor.execute_from_log_line(line)
             check_gdb_stub_and_run(line_strip)
             self._force_line_print = False
+            self._observe_line(decoded_line)
 
         if self._last_line_part.startswith(CONSOLE_STATUS_QUERY):
             self.logger.print(CONSOLE_STATUS_QUERY)
@@ -268,6 +284,9 @@ class SerialHandler:
             self.logger.handle_possible_pc_address_in_line(self._last_line_part, insert_new_line=True)
             self.monitor_cmd_executor.execute_from_log_line(self._last_line_part)
             check_gdb_stub_and_run(self._last_line_part)
+            # let the observer see finalized partial lines as well, e.g. a
+            # prompt without a line ending
+            self._observe_line(self._last_line_part)
             # It is possible that the incomplete line cuts in half the PC
             # address. A small buffer is kept and will be used the next time
             # handle_possible_pc_address_in_line is invoked to avoid this problem.
@@ -344,7 +363,7 @@ class SerialHandler:
                 )
 
     def handle_commands(self, cmd, chip, run_make_func, console_reader, serial_reader):
-        # type: (int, str, Callable, ConsoleReader, Reader) -> None
+        # type: (int, str, Callable, StoppableThread, Reader) -> None
 
         if chip == 'linux':
             if cmd in [CMD_RESET, CMD_MAKE, CMD_APP_FLASH, CMD_ENTER_BOOT]:
@@ -396,10 +415,12 @@ class SerialHandlerNoElf(SerialHandler):
             if self._serial_check_exit and line.strip() == EXIT_KEY.encode('latin-1'):
                 raise SerialStopException()
 
-            if self._force_line_print or line_matcher.match(line.decode(errors='ignore')):
+            decoded_line = line.decode(errors='ignore')
+            if self._force_line_print or line_matcher.match(decoded_line):
                 self.print_colored(line)
                 self.monitor_cmd_executor.execute_from_log_line(line)
                 self._force_line_print = False
+            self._observe_line(decoded_line)
 
         if self._last_line_part.startswith(CONSOLE_STATUS_QUERY):
             self.logger.print(CONSOLE_STATUS_QUERY)
@@ -416,4 +437,7 @@ class SerialHandlerNoElf(SerialHandler):
             self._force_line_print = True
             self.print_colored(self._last_line_part)
             self.monitor_cmd_executor.execute_from_log_line(self._last_line_part)
+            # let the observer see finalized partial lines as well, e.g. a
+            # prompt without a line ending
+            self._observe_line(self._last_line_part)
             self._last_line_part = b''
