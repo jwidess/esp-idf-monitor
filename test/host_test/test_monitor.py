@@ -6,6 +6,7 @@ import datetime
 import errno
 import filecmp
 import os
+import queue
 import random
 import re
 import socket
@@ -22,6 +23,18 @@ from typing import Tuple
 import pytest
 
 from esp_idf_monitor.base.binlog import BinaryLog
+from esp_idf_monitor.base.command_reader import CommandReader
+from esp_idf_monitor.base.console_parser import ConsoleParser
+from esp_idf_monitor.base.constants import CMD_APP_FLASH
+from esp_idf_monitor.base.constants import CMD_ENTER_BOOT
+from esp_idf_monitor.base.constants import CMD_MAKE
+from esp_idf_monitor.base.constants import CMD_OUTPUT_TOGGLE
+from esp_idf_monitor.base.constants import CMD_RESET
+from esp_idf_monitor.base.constants import CMD_STOP
+from esp_idf_monitor.base.constants import CMD_TOGGLE_LOGGING
+from esp_idf_monitor.base.constants import CMD_TOGGLE_TIMESTAMPS
+from esp_idf_monitor.base.constants import TAG_CMD
+from esp_idf_monitor.base.constants import TAG_KEY
 from esp_idf_monitor.base.logger import Logger
 
 from .conftest import out_dir
@@ -956,3 +969,309 @@ class TestLogger:
         assert logger.pc_address_buffer == b''
         logger.pc_address_buffer = b'suffix'
         assert logger.pc_address_buffer == b''
+
+
+class TestCommandReader:
+    """Unit tests for the non-interactive command reader (CommandReader).
+
+    The reader is exercised directly through _handle_line()/observe_line()
+    without spawning the monitor, so these are fast and run on every platform.
+    """
+
+    def _reader(self, eol: str = 'CR') -> Tuple[queue.Queue, CommandReader]:
+        event_queue: queue.Queue = queue.Queue()
+        reader = CommandReader(event_queue, ConsoleParser(eol))
+        return event_queue, reader
+
+    def _drain(self, event_queue: queue.Queue) -> List[Tuple]:
+        """Return everything queued so far, in order."""
+        items = []
+        while not event_queue.empty():
+            items.append(event_queue.get_nowait())
+        return items
+
+    @pytest.mark.parametrize(
+        'command, expected_cmd',
+        [
+            ('reset', CMD_RESET),
+            ('flash', CMD_MAKE),
+            ('app-flash', CMD_APP_FLASH),
+            ('output', CMD_OUTPUT_TOGGLE),
+            ('log', CMD_TOGGLE_LOGGING),
+            ('timestamps', CMD_TOGGLE_TIMESTAMPS),
+            ('bootloader', CMD_ENTER_BOOT),
+        ],
+    )
+    def test_simple_command_maps_to_event(self, command: str, expected_cmd: int):
+        """Each simple command is queued as a single (TAG_CMD, <cmd>) event."""
+        event_queue, reader = self._reader()
+        assert reader._handle_line(command) is True
+        assert self._drain(event_queue) == [(TAG_CMD, expected_cmd)]
+
+    def test_command_is_case_insensitive(self):
+        """Commands are matched regardless of case."""
+        event_queue, reader = self._reader()
+        assert reader._handle_line('ReSeT') is True
+        assert self._drain(event_queue) == [(TAG_CMD, CMD_RESET)]
+
+    @pytest.mark.parametrize(
+        'eol, expected',
+        [
+            ('CR', 'free\r'),
+            ('LF', 'free\n'),
+            ('CRLF', 'free\r\n'),
+        ],
+    )
+    def test_send_translates_eol(self, eol: str, expected: str):
+        """'send <text>' queues a key event with the text and target EOL."""
+        event_queue, reader = self._reader(eol)
+        assert reader._handle_line('send free') is True
+        assert self._drain(event_queue) == [(TAG_KEY, expected)]
+
+    def test_exit_stops_reading_and_requests_stop(self):
+        """'exit' queues a stop command and returns False to stop reading."""
+        event_queue, reader = self._reader()
+        assert reader._handle_line('exit') is False
+        assert self._drain(event_queue) == [(TAG_CMD, CMD_STOP)]
+
+    @pytest.mark.parametrize('line', ['', '# a comment', '#reset'])
+    def test_blank_and_comment_lines_are_ignored(self, line: str):
+        """Empty lines and lines starting with '#' are skipped, queuing nothing."""
+        event_queue, reader = self._reader()
+        assert reader._handle_line(line) is True
+        assert self._drain(event_queue) == []
+
+    def test_unknown_command_is_reported_without_event(self):
+        """An unknown command keeps the reader running but queues nothing."""
+        event_queue, reader = self._reader()
+        assert reader._handle_line('frobnicate') is True
+        assert self._drain(event_queue) == []
+
+    def test_invalid_sleep_duration_is_ignored(self):
+        """A non-numeric sleep duration is reported but does not stop the script."""
+        event_queue, reader = self._reader()
+        assert reader._handle_line('sleep soon') is True
+        assert self._drain(event_queue) == []
+
+    def test_invalid_expect_pattern_stops_reader(self):
+        """An invalid 'expect' regex aborts the script: stop is queued and reading stops."""
+        event_queue, reader = self._reader()
+        assert reader._handle_line('expect [unterminated') is False
+        assert self._drain(event_queue) == [(TAG_CMD, CMD_STOP)]
+
+    def test_expect_observe_line_matches_pattern(self):
+        """observe_line wakes a pending 'expect' when a serial line matches."""
+        _, reader = self._reader()
+        reader._expect_pattern = re.compile('READY')
+        reader.observe_line('I (123) app: device is READY now')
+        assert reader._expect_matched.is_set()
+
+    def test_expect_dollar_anchor_matches_despite_crlf(self):
+        """Line endings are stripped before matching, so '$' works on CRLF output."""
+        _, reader = self._reader()
+        reader._expect_pattern = re.compile('READY$')
+        reader.observe_line('I (123) app: READY\r\n')
+        assert reader._expect_matched.is_set()
+
+    def test_expect_non_matching_line_does_not_wake(self):
+        """A non-matching line leaves the pending 'expect' unsatisfied."""
+        _, reader = self._reader()
+        reader._expect_pattern = re.compile('READY')
+        reader.observe_line('I (123) app: still booting')
+        assert not reader._expect_matched.is_set()
+
+    def test_observe_line_without_armed_pattern_is_noop(self):
+        """With no pending 'expect', observed lines do not wake it (and do not crash)."""
+        _, reader = self._reader()
+        reader.observe_line('anything at all')
+        assert not reader._expect_matched.is_set()
+
+    def test_expect_matches_already_buffered_line(self):
+        """'expect' matches output received before it was armed (the look-back buffer)."""
+        _, reader = self._reader()
+        reader.observe_line('I (1) app: device READY now')  # buffered, no pattern armed yet
+        reader._expect(re.compile('READY'))  # scans the look-back buffer
+        assert reader._expect_matched.is_set()
+
+    def test_expect_consumes_buffer_up_to_match(self):
+        """A buffered match is consumed up to that line; later lines stay for the next 'expect'."""
+        _, reader = self._reader()
+        reader.observe_line('first line')
+        reader.observe_line('the MATCH line')
+        reader.observe_line('line after the match')
+        reader._expect(re.compile('MATCH'))
+        assert reader._expect_matched.is_set()
+        # the line after the match is still available for the next 'expect'
+        reader._expect(re.compile('after'))
+        assert reader._expect_matched.is_set()
+
+    def test_command_does_not_drop_buffered_output(self):
+        """Commands must not clear the look-back buffer: a line observed around a
+        command (e.g. the reply to a 'send') stays available to a following
+        'expect'. Clearing it would be a cross-thread clear/observe race."""
+        _, reader = self._reader()
+        reader.observe_line('I (1) app: READY')  # buffered before the command
+        reader._handle_line('reset')  # must not drop the buffer
+        reader._expect(re.compile('READY'))  # still matched
+        assert reader._expect_matched.is_set()
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='Linux/MacOS only')
+class TestCommandMode(TestBaseClass):
+    """End-to-end tests for the non-interactive command mode.
+
+    stdin is a pipe or /dev/null (never a TTY) and ESP_IDF_MONITOR_TEST is
+    unset, so the monitor switches to command mode and reads line-based
+    commands from stdin. The TCP server socket from the get_port fixture acts
+    as the device the monitor is connected to.
+    """
+
+    def run_command_monitor(self, stdin: int, args: Optional[List[str]] = None) -> Tuple[str, str]:
+        """Spawn the monitor in non-interactive command mode.
+
+        stdin is passed to Popen: subprocess.PIPE to feed a command script, or
+        subprocess.DEVNULL for the watch-only case. Returns stdout/stderr files.
+        """
+        cmd = [
+            sys.executable,
+            '-m',
+            'esp_idf_monitor',
+            '--port',
+            f'socket://{HOST}:{self.port}?logging=debug',
+        ] + (args or [])
+        env = os.environ.copy()
+        # turn off the interactive socket-test mode so that stdin (not a TTY
+        # here) selects the non-interactive command mode
+        env.pop('ESP_IDF_MONITOR_TEST', None)
+        output_file = os.path.join(out_dir, filename_fix(self.test_name))
+        with open(f'{output_file}.out', 'w') as o_f, open(f'{output_file}.err', 'w') as e_f:
+            self.proc = subprocess.Popen(cmd, env=env, stdin=stdin, stdout=o_f, stderr=e_f)
+        # let the monitor start up and finish the initial reset (which flushes
+        # the serial input buffer) before the test sends serial data, matching
+        # run_monitor_async
+        time.sleep(1)
+        return f'{output_file}.out', f'{output_file}.err'
+
+    def accept(self, timeout: int = 20) -> socket.socket:
+        """Accept the monitor's serial-port connection on the server socket."""
+        self.serversocket.settimeout(timeout)
+        # annotate the local: self.serversocket is untyped (Any) in the base class
+        clientsocket: socket.socket = self.serversocket.accept()[0]
+        return clientsocket
+
+    def wait_exit(self, timeout: int = 15) -> Optional[int]:
+        """Wait for the monitor process to exit, failing the test on timeout."""
+        watchdog = threading.Timer(timeout, on_timeout, [self.proc])
+        watchdog.start()
+        try:
+            while True:
+                ret = self.proc.poll()
+                if ret is not None:
+                    return ret
+                time.sleep(0.2)
+        finally:
+            watchdog.cancel()
+
+    def wait_for_output(self, path: str, needle: str, timeout: int = 10) -> bool:
+        """Poll the output file until it contains needle or the timeout elapses."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with open(path) as f:
+                if needle in f.read():
+                    return True
+            time.sleep(0.2)
+        return False
+
+    def teardown_method(self):
+        """Make sure the monitor process is not left running."""
+        proc = getattr(self, 'proc', None)
+        try:
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+    def test_command_mode_detected_and_eof_exits(self):
+        """Non-TTY stdin selects command mode; the script runs and EOF exits."""
+        out, err = self.run_command_monitor(subprocess.PIPE)
+        clientsocket = self.accept()  # wait for the monitor to connect its serial port
+        try:
+            assert self.proc.stdin is not None
+            self.proc.stdin.write(b'output\n')  # a harmless toggle, just to be echoed
+            self.proc.stdin.close()  # EOF right after the one-line script
+            ret = self.wait_exit()
+        finally:
+            clientsocket.close()
+        assert ret == 0
+        with open(err) as f_err:
+            stderr = f_err.read()
+        assert 'running in non-interactive mode' in stderr
+        assert "--- Command: 'output'" in stderr
+        assert 'EOF received on standard input, exiting' in stderr
+
+    def test_sleep_then_expect_matches_serial_output(self):
+        """'sleep' skips ahead, then 'expect' waits for a regex in the serial output.
+
+        'expect' as the last command turns EOF into exit-on-pattern, and the
+        '$' anchor matches despite the CRLF line ending from the device.
+        """
+        out, err = self.run_command_monitor(subprocess.PIPE)
+        clientsocket = self.accept()
+        try:
+            assert self.proc.stdin is not None
+            self.proc.stdin.write(b'sleep 0.2\nexpect READY$\n')
+            self.proc.stdin.close()
+            # give the reader time to consume 'sleep' and arm 'expect'
+            time.sleep(1)
+            clientsocket.sendall(b'I (100) app: still booting\r\n')
+            clientsocket.sendall(b'I (200) app: READY\r\n')
+            ret = self.wait_exit()
+        finally:
+            clientsocket.close()
+        assert ret == 0
+        with open(err) as f_err:
+            stderr = f_err.read()
+        assert "Expect pattern 'READY$' matched" in stderr
+
+    def test_send_writes_to_the_device(self):
+        """'send <text>' writes the text (followed by EOL) to the serial device."""
+        out, err = self.run_command_monitor(subprocess.PIPE)
+        clientsocket = self.accept()
+        clientsocket.settimeout(15)
+        received = b''
+        try:
+            assert self.proc.stdin is not None
+            self.proc.stdin.write(b'send hello\nexit\n')
+            self.proc.stdin.close()
+            while b'hello' not in received:
+                try:
+                    chunk = clientsocket.recv(1024)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                received += chunk
+            ret = self.wait_exit()
+        finally:
+            clientsocket.close()
+        assert b'hello' in received
+        assert ret == 0
+
+    def test_watch_only_mode_exits_on_sigterm(self):
+        """Empty stdin selects watch-only mode; SIGTERM shuts the monitor down cleanly."""
+        out, err = self.run_command_monitor(subprocess.DEVNULL)
+        clientsocket = self.accept()
+        printed = False
+        try:
+            clientsocket.sendall(b'I (1) app: hello from device\r\n')
+            # wait until the line has actually been decoded and printed
+            printed = self.wait_for_output(out, 'hello from device')
+            self.proc.terminate()  # SIGTERM -> clean shutdown (like docker stop)
+            ret = self.wait_exit()
+        finally:
+            clientsocket.close()
+        assert printed, 'serial output was not printed in watch-only mode'
+        assert ret == 0
+        with open(err) as f_err:
+            stderr = f_err.read()
+        assert 'No commands on standard input, watching serial output only' in stderr
