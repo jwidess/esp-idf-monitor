@@ -45,7 +45,8 @@ if os.name != 'nt':
 HOST = '127.0.0.1'
 
 IN_DIR = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'inputs')  # input files for tests
-EXIT_KEY = b'\x1d\n'  # CTRL+]
+# unique marker fed over the serial socket to stop the monitor in command mode (matched by 'expect')
+STOP_MARKER = 'ESP_IDF_MONITOR_STOP'
 
 
 def on_timeout(process):
@@ -80,7 +81,7 @@ class TestBaseClass:
 
     def send_control(self, sequence: str):
         """Send a control sequence to monitor STDIN
-        Note: Monitor needs to be running in async mode with 'ignore_input' set to False
+        Note: Monitor needs to be running in interactive async mode (run_monitor_async)
         """
         if self.master_fd is None:
             raise ValueError('Master FD is not set')
@@ -105,12 +106,12 @@ class TestBaseClass:
             pytest.fail(f'Monitor took longer than {timeout} seconds to exit')
         return ret
 
-    def run_monitor_async(
-        self, args: List[str] = [], custom_port: str = '', ignore_input: bool = False
-    ) -> Tuple[str, str]:
-        """Run monitor in async mode
-        ignore_input=True will disable input and enable monitor test mode
-        Returns filenames for stdout and stderr
+    def run_monitor_async(self, args: List[str] = [], custom_port: str = '') -> Tuple[str, str]:
+        """Run the monitor asynchronously in interactive mode (stdin on a PTY).
+
+        The monitor keeps running after this returns; drive it with
+        send_control() and stop it with close_monitor_async(). Returns the
+        stdout and stderr filenames.
         """
         cmd = [
             sys.executable,
@@ -119,10 +120,6 @@ class TestBaseClass:
             '--port',
             custom_port if custom_port else f'socket://{HOST}:{self.port}?logging=debug',
         ] + args
-        env = os.environ.copy()
-        if ignore_input:
-            # enable closing the monitor from a socket and disable reading the input
-            env['ESP_IDF_MONITOR_TEST'] = '1'
         output_file = os.path.join(out_dir, filename_fix(self.test_name))
         if os.name == 'nt':
             self.master_fd, self.slave_fd = None, None
@@ -130,18 +127,56 @@ class TestBaseClass:
             # stdin needs to be connected to some pseudo-tty in docker image even when it is not used at all
             self.master_fd, self.slave_fd = pty.openpty()
         with open(f'{output_file}.out', 'w') as o_f, open(f'{output_file}.err', 'w') as e_f:
-            self.proc = subprocess.Popen(cmd, env=env, stdin=self.slave_fd, stdout=o_f, stderr=e_f)
+            self.proc = subprocess.Popen(cmd, stdin=self.slave_fd, stdout=o_f, stderr=e_f)
         # make sure monitor is running before sending data
         time.sleep(3 if os.name == 'nt' else 1)
         return f'{output_file}.out', f'{output_file}.err'
 
+    def run_monitor_command_mode(
+        self, args: List[str] = [], custom_port: str = '', stdin: int = subprocess.PIPE
+    ) -> Tuple[str, str]:
+        """Run the monitor in non-interactive command mode.
+
+        stdin is not a TTY (a pipe or /dev/null), so the monitor reads
+        line-based commands from it (CommandReader). The monitor keeps running
+        after this returns. Returns the stdout and stderr filenames.
+        """
+        cmd = [
+            sys.executable,
+            '-m',
+            'esp_idf_monitor',
+            '--port',
+            custom_port if custom_port else f'socket://{HOST}:{self.port}?logging=debug',
+        ] + args
+        # no PTY here: command mode is exactly the "stdin is not a TTY" path
+        self.master_fd, self.slave_fd = None, None
+        output_file = os.path.join(out_dir, filename_fix(self.test_name))
+        with open(f'{output_file}.out', 'w') as o_f, open(f'{output_file}.err', 'w') as e_f:
+            self.proc = subprocess.Popen(cmd, stdin=stdin, stdout=o_f, stderr=e_f)
+        # let the monitor start up and finish the initial reset (which flushes
+        # the serial input buffer) before the test sends serial data
+        time.sleep(3 if os.name == 'nt' else 1)
+        return f'{output_file}.out', f'{output_file}.err'
+
+    def strip_marker(self, path: str) -> None:
+        """Remove the stop-marker line (injected by run_monitor) from the output."""
+        with open(path, 'rb') as f:
+            lines = f.readlines()
+        with open(path, 'wb') as f:
+            f.writelines(line for line in lines if STOP_MARKER.encode() not in line)
+
     def run_monitor(
         self, args: List[str], input_file: str, custom_port: str = '', timeout: int = 60
     ) -> Tuple[str, str]:
-        """Run IDF Monitor in test mode with timeout
-        Returns filenames for stdout and stderr
+        """Run IDF Monitor over an input file with a timeout.
+
+        The monitor runs in non-interactive command mode. input_file is streamed
+        over the serial socket, followed by a unique marker line; the 'expect'
+        command waits for that marker, so the monitor exits only after all the
+        input has been decoded and printed. The marker line is stripped from the
+        captured stdout. Returns the stdout and stderr filenames.
         """
-        out, err = self.run_monitor_async(args, custom_port=custom_port, ignore_input=True)
+        out, err = self.run_monitor_command_mode(args, custom_port=custom_port)
         # create a timer
         monitor_watchdog = threading.Timer(timeout, on_timeout, [self.proc])
         monitor_watchdog.start()
@@ -149,14 +184,20 @@ class TestBaseClass:
         # make sure that monitor is running, else we will end in an infinite loop
         if self.proc.poll() is not None:
             pytest.fail('Monitor has already ended')
+        assert self.proc.stdin is not None
+        # arm 'expect' for the stop marker; the following EOF makes the monitor
+        # exit once the marker is seen
+        self.proc.stdin.write(f'expect {STOP_MARKER}\n'.encode())
+        self.proc.stdin.close()
         # send input file content to socket
         clientsocket, _ = self.serversocket.accept()
         try:
             with open(os.path.join(IN_DIR, input_file), 'rb') as f:
                 for chunk in iter(lambda: f.read(1024), b''):
                     clientsocket.sendall(chunk)
-            # end monitor
-            clientsocket.sendall(EXIT_KEY)
+            # marker as the last serial line: once it is decoded, all of the
+            # input has been processed
+            clientsocket.sendall(f'{STOP_MARKER}\n'.encode())
             # wait for process to end
             while True:
                 ret = self.proc.poll()
@@ -167,6 +208,8 @@ class TestBaseClass:
             monitor_watchdog.cancel()
         finally:
             clientsocket.close()
+        # drop the marker line so the captured output matches the golden files
+        self.strip_marker(out)
         return out, err
 
     def filecmp(self, file: str, expected_out: str) -> bool:
@@ -257,7 +300,7 @@ class TestHost(TestBaseClass):
         out, err = self.run_monitor(args, input_file, timeout=timeout)
         with open(err) as f_err:
             stderr = f_err.read()
-            assert 'Stopping condition has been received' in stderr
+            assert f"Expect pattern '{STOP_MARKER}' matched" in stderr
         assert self.filecmp(out, expected_out)
 
     def test_auto_color(self):
@@ -266,7 +309,7 @@ class TestHost(TestBaseClass):
         out, err = self.run_monitor([], 'color.txt')
         with open(err) as f_err:
             stderr = f_err.read()
-            assert 'Stopping condition has been received' in stderr
+            assert f"Expect pattern '{STOP_MARKER}' matched" in stderr
         assert self.filecmp(out, 'color_out.txt')
 
     @pytest.mark.skipif(os.name == 'nt', reason='Linux/MacOS only')
@@ -310,7 +353,7 @@ class TestHost(TestBaseClass):
         regex = re.compile(rf"--- esp-idf-monitor \d\.\d(\.\d)? on {re.escape(rfc2217)} \d*")
         assert regex.search(stderr) is not None
         assert 'Exception' not in stderr
-        assert 'Stopping condition has been received' in stderr
+        assert f"Expect pattern '{STOP_MARKER}' matched" in stderr
         assert self.filecmp(out, 'in1f1.txt')
 
     @pytest.mark.skipif(os.name == 'nt', reason='Linux/MacOS only')
@@ -393,7 +436,7 @@ class TestBinaryLogging(TestBaseClass):
         out, err = self.run_monitor(args, 'binlog', timeout=10)
         with open(err) as f_err:
             stderr = f_err.read()
-            assert 'Stopping condition has been received' in stderr
+            assert f"Expect pattern '{STOP_MARKER}' matched" in stderr
 
         ansi_regex = re.compile(r'\x1B\[\d+(;\d+){0,2}m')
         with open(out) as f_out, open(os.path.join(IN_DIR, 'binlog_out.txt')) as f_expected:
@@ -441,7 +484,7 @@ class TestBinaryLogging(TestBaseClass):
         print('Using binary log file: ', invalid_binary_log)
         with open(err) as f_err:
             stderr = f_err.read()
-            assert 'Stopping condition has been received' in stderr
+            assert f"Expect pattern '{STOP_MARKER}' matched" in stderr
 
         # Verify that monitor didn't get stuck and processed all data; ignore errors because we are using random data
         with open(out, errors='ignore') as f_out:
@@ -1120,37 +1163,11 @@ class TestCommandReader:
 class TestCommandMode(TestBaseClass):
     """End-to-end tests for the non-interactive command mode.
 
-    stdin is a pipe or /dev/null (never a TTY) and ESP_IDF_MONITOR_TEST is
-    unset, so the monitor switches to command mode and reads line-based
-    commands from stdin. The TCP server socket from the get_port fixture acts
-    as the device the monitor is connected to.
+    stdin is a pipe or /dev/null (never a TTY), so the monitor switches to
+    command mode and reads line-based commands from stdin (CommandReader). The
+    TCP server socket from the get_port fixture acts as the device the monitor
+    is connected to.
     """
-
-    def run_command_monitor(self, stdin: int, args: Optional[List[str]] = None) -> Tuple[str, str]:
-        """Spawn the monitor in non-interactive command mode.
-
-        stdin is passed to Popen: subprocess.PIPE to feed a command script, or
-        subprocess.DEVNULL for the watch-only case. Returns stdout/stderr files.
-        """
-        cmd = [
-            sys.executable,
-            '-m',
-            'esp_idf_monitor',
-            '--port',
-            f'socket://{HOST}:{self.port}?logging=debug',
-        ] + (args or [])
-        env = os.environ.copy()
-        # turn off the interactive socket-test mode so that stdin (not a TTY
-        # here) selects the non-interactive command mode
-        env.pop('ESP_IDF_MONITOR_TEST', None)
-        output_file = os.path.join(out_dir, filename_fix(self.test_name))
-        with open(f'{output_file}.out', 'w') as o_f, open(f'{output_file}.err', 'w') as e_f:
-            self.proc = subprocess.Popen(cmd, env=env, stdin=stdin, stdout=o_f, stderr=e_f)
-        # let the monitor start up and finish the initial reset (which flushes
-        # the serial input buffer) before the test sends serial data, matching
-        # run_monitor_async
-        time.sleep(1)
-        return f'{output_file}.out', f'{output_file}.err'
 
     def accept(self, timeout: int = 20) -> socket.socket:
         """Accept the monitor's serial-port connection on the server socket."""
@@ -1193,7 +1210,7 @@ class TestCommandMode(TestBaseClass):
 
     def test_command_mode_detected_and_eof_exits(self):
         """Non-TTY stdin selects command mode; the script runs and EOF exits."""
-        out, err = self.run_command_monitor(subprocess.PIPE)
+        out, err = self.run_monitor_command_mode()
         clientsocket = self.accept()  # wait for the monitor to connect its serial port
         try:
             assert self.proc.stdin is not None
@@ -1215,7 +1232,7 @@ class TestCommandMode(TestBaseClass):
         'expect' as the last command turns EOF into exit-on-pattern, and the
         '$' anchor matches despite the CRLF line ending from the device.
         """
-        out, err = self.run_command_monitor(subprocess.PIPE)
+        out, err = self.run_monitor_command_mode()
         clientsocket = self.accept()
         try:
             assert self.proc.stdin is not None
@@ -1235,7 +1252,7 @@ class TestCommandMode(TestBaseClass):
 
     def test_send_writes_to_the_device(self):
         """'send <text>' writes the text (followed by EOL) to the serial device."""
-        out, err = self.run_command_monitor(subprocess.PIPE)
+        out, err = self.run_monitor_command_mode()
         clientsocket = self.accept()
         clientsocket.settimeout(15)
         received = b''
@@ -1259,7 +1276,7 @@ class TestCommandMode(TestBaseClass):
 
     def test_watch_only_mode_exits_on_sigterm(self):
         """Empty stdin selects watch-only mode; SIGTERM shuts the monitor down cleanly."""
-        out, err = self.run_command_monitor(subprocess.DEVNULL)
+        out, err = self.run_monitor_command_mode(stdin=subprocess.DEVNULL)
         clientsocket = self.accept()
         printed = False
         try:

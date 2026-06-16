@@ -36,10 +36,8 @@ from .constants import PANIC_READING_STACK
 from .constants import PANIC_STACK_DUMP
 from .constants import PANIC_START
 from .coredump import CoreDump  # noqa: F401
-from .exceptions import SerialStopException
 from .gdbhelper import GDBHelper  # noqa: F401
 from .key_config import CHIP_RESET_KEY
-from .key_config import EXIT_KEY
 from .key_config import MENU_KEY
 from .line_matcher import LineMatcher  # noqa: F401
 from .logger import Logger  # noqa: F401
@@ -95,7 +93,6 @@ class SerialHandler:
     def __init__(
         self,
         last_line_part,
-        serial_check_exit,
         logger,
         decode_panic,
         reading_panic,
@@ -110,9 +107,8 @@ class SerialHandler:
         disable_auto_color,
         line_observer=None,
     ):
-        # type: (bytes, bool, Logger, str, int, bytes, str, bool, bool, serial.Serial, bool, List[str], str, bool, Optional[Callable[[str], None]]) -> None
+        # type: (bytes, Logger, str, int, bytes, str, bool, bool, serial.Serial, bool, List[str], str, bool, Optional[Callable[[str], None]]) -> None
         self._last_line_part = last_line_part
-        self._serial_check_exit = serial_check_exit
         self.logger = logger
         self._decode_panic = decode_panic
         self._reading_panic = reading_panic
@@ -238,8 +234,6 @@ class SerialHandler:
 
         for line in sp:
             line_strip = line.strip()
-            if self._serial_check_exit and line_strip == EXIT_KEY.encode('latin-1'):
-                raise SerialStopException()
             if self.target != 'linux':
                 self.check_panic_decode_trigger(line_strip)
             with coredump.check(line_strip):
@@ -412,9 +406,6 @@ class SerialHandlerNoElf(SerialHandler):
 
         sp = self.splitdata(data)
         for line in sp:
-            if self._serial_check_exit and line.strip() == EXIT_KEY.encode('latin-1'):
-                raise SerialStopException()
-
             decoded_line = line.decode(errors='ignore')
             if self._force_line_print or line_matcher.match(decoded_line):
                 self.print_colored(line)

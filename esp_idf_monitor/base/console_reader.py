@@ -21,14 +21,13 @@ class ConsoleReader(StoppableThread):
     until stopped.
     """
 
-    def __init__(self, console, event_queue, cmd_queue, parser, test_mode):
-        # type: (Console, queue.Queue, queue.Queue, ConsoleParser, bool) -> None
+    def __init__(self, console, event_queue, cmd_queue, parser):
+        # type: (Console, queue.Queue, queue.Queue, ConsoleParser) -> None
         super().__init__()
         self.console = console
         self.event_queue = event_queue
         self.cmd_queue = cmd_queue
         self.parser = parser
-        self.test_mode = test_mode
         self.cmd_stop_count = 0
         if sys.platform == 'win32':
             # This is a workaround for multi-byte characters causing the console to be killed by OS.
@@ -56,7 +55,7 @@ class ConsoleReader(StoppableThread):
         try:
             while self.alive:
                 try:
-                    if os.name == 'nt' and not self.test_mode:
+                    if os.name == 'nt':
                         # Windows kludge: because the console.cancel() method doesn't
                         # seem to work to unblock getkey() on the Windows implementation.
                         #
@@ -67,13 +66,6 @@ class ConsoleReader(StoppableThread):
                             time.sleep(0.1)
                         if not self.alive:
                             break
-                    elif self.test_mode:
-                        # In testing mode the stdin is connected to PTY but is not used for input anything. For PTY
-                        # the canceling by fcntl.ioctl isn't working and would hang in self.console.getkey().
-                        # Therefore, we avoid calling it.
-                        while self.alive:
-                            time.sleep(0.1)
-                        break
                     c = self.console.getkey()
                 except KeyboardInterrupt:
                     c = '\x03'

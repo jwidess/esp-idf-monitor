@@ -71,7 +71,6 @@ from esp_idf_monitor.base.constants import TAG_SERIAL
 from esp_idf_monitor.base.constants import TAG_SERIAL_FLUSH
 from esp_idf_monitor.base.coredump import COREDUMP_DECODE_INFO
 from esp_idf_monitor.base.coredump import CoreDump
-from esp_idf_monitor.base.exceptions import SerialStopException
 from esp_idf_monitor.base.gdbhelper import GDBHelper
 from esp_idf_monitor.base.key_config import EXIT_KEY
 from esp_idf_monitor.base.key_config import EXIT_MENU_KEY
@@ -165,8 +164,6 @@ class Monitor:
         self.timeout_cnt = 0
 
         if isinstance(self, SerialMonitor):
-            # testing hook: when running tests, input from console is ignored
-            socket_test_mode = os.environ.get('ESP_IDF_MONITOR_TEST') == '1'
             self.serial = serial_instance
             self.serial_reader = SerialReader(self.serial, self.event_queue, reset, open_port_attempts, target)  # type: Reader
 
@@ -177,8 +174,6 @@ class Monitor:
             )
 
         else:
-            socket_test_mode = False
-
             if len(self.elf_files) > 1:
                 warning_print(
                     f'Found {len(self.elf_files)} ELF files, but Linux target only supports one. '
@@ -208,15 +203,12 @@ class Monitor:
             # feed every decoded serial line to the reader for the 'expect' command
             line_observer = command_reader.observe_line  # type: Optional[Callable[[str], None]]
         else:
-            self.console_reader = ConsoleReader(
-                self.console, self.event_queue, self.cmd_queue, self.console_parser, socket_test_mode
-            )
+            self.console_reader = ConsoleReader(self.console, self.event_queue, self.cmd_queue, self.console_parser)
             line_observer = None
 
         cls = SerialHandler if self.elf_exists else SerialHandlerNoElf
         self.serial_handler = cls(
             b'',
-            socket_test_mode,
             self.logger,
             decode_panic,
             PANIC_IDLE,
@@ -303,8 +295,6 @@ class Monitor:
                         f'you can use {key_description(MENU_KEY)} {key_description(EXIT_MENU_KEY)} to exit.'
                     )
                     self.serial_write(codecs.encode(CTRL_C))
-        except SerialStopException:
-            normal_print('Stopping condition has been received\n')
         except KeyboardInterrupt:
             pass
         finally:
@@ -484,7 +474,7 @@ def main() -> None:
     # Without a TTY on stdin (pipe, file, CI) interactive key reading is not
     # possible; switch to the non-interactive mode, where line-based commands
     # are read from stdin instead (see CommandReader).
-    non_interactive = not sys.stdin.isatty() and not os.environ.get('ESP_IDF_MONITOR_TEST')
+    non_interactive = not sys.stdin.isatty()
 
     # use EOL from argument; defaults to LF for Linux targets and CR otherwise
     args.eol = args.eol or ('LF' if args.target == 'linux' else 'CR')
