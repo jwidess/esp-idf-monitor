@@ -13,6 +13,7 @@ Other advanced topics like configuration file will be described in the following
 
 - [Installation](#installation)
 - [Usage](#usage)
+- [Non-Interactive (Scripting) Mode](#non-interactive-scripting-mode)
 - [Configuration File](#configuration-file)
   - [File Location](#file-location)
   - [Configuration Options](#configuration-options)
@@ -55,6 +56,71 @@ python -m esp_idf_monitor
 ```
 
 For all parameters and their function please see `idf-monitor --help`.
+
+## Non-Interactive (Scripting) Mode
+
+The interactive key bindings require a terminal (TTY) on standard input. When standard input is **not** a TTY — for example a pipe, a file, or when the monitor runs in a CI job or a Docker container — the monitor automatically switches to a **non-interactive command mode** instead of exiting with an error. In this mode it reads line-based commands from standard input, so the monitor can be driven by a shell script, a CI job, or another program, while keeping all of its added value (log decoding, coloring, logging to a file).
+
+There are no extra command-line options: the mode is selected automatically based on whether standard input is a TTY.
+
+```sh
+printf 'reset\nexpect ALL TESTS PASSED\n' | idf-monitor /dev/ttyUSB0
+```
+
+### Commands
+
+| Command | Action |
+| --- | --- |
+| `reset` | Hard-reset the chip via the RTS line |
+| `flash` | Run the make / `idf.py` `flash` target |
+| `app-flash` | Run the make / `idf.py` `app-flash` target |
+| `send <text>` | Send `<text>` followed by the end-of-line to the device |
+| `sleep <seconds>` | Pause the script for the given time while serial output keeps flowing (accepts floats and `inf`) |
+| `expect <regex>` | Block the script until a serial line matches the [regular expression](https://docs.python.org/3/library/re.html) (using `re.search`) |
+| `output` | Toggle printing of the serial output |
+| `log` | Toggle saving the output into a file |
+| `timestamps` | Toggle prepending timestamps to the output |
+| `bootloader` | Reset the chip into the download (bootloader) mode |
+| `exit` | Quit the monitor; pending serial output is drained first |
+
+Empty lines and lines starting with `#` are ignored. Every processed command is echoed to **standard error**, so the progress of the script stays visible even when standard output is redirected to a file.
+
+The line ending is stripped before an `expect` match, so a `$` anchor works regardless of whether the device terminates lines with `LF` or `CRLF`.
+
+### Examples
+
+**Wait for a pattern, then exit (exit-on-pattern).** As the last command of a script, `expect` turns the end of the script into an exit-on-pattern condition:
+
+```sh
+printf 'expect ALL TESTS PASSED\n' | idf-monitor /dev/ttyUSB0 > test.log
+```
+
+**Reset and capture a few seconds of the boot log.** No `exit` is needed — reaching the end of the script (EOF on standard input) ends the session:
+
+```sh
+printf 'reset\nsleep 10\n' | idf-monitor /dev/ttyUSB0 > boot.log
+```
+
+**Drive a console application.** `expect` works mid-script too, including on prompts printed without a line ending:
+
+```sh
+idf-monitor /dev/ttyUSB0 <<'EOF'
+reset
+expect esp>
+send free
+expect \d+
+exit
+EOF
+```
+
+**Watch-only mode in CI / Docker.** When standard input is empty from the start (for example `/dev/null`, or `docker run` without `-i`), there is no script to follow, so the monitor just watches the serial output until it is stopped from the outside (`Ctrl+C`, or `SIGTERM` from `docker stop` or a CI job timeout). A log file, if enabled, is flushed and closed on exit:
+
+```sh
+idf-monitor --save-log /dev/ttyUSB0 < /dev/null
+```
+
+> [!NOTE]
+> Because there is no terminal, an interactive GDB session cannot be started from the chip-side GDB stub while running in non-interactive mode.
 
 ## Configuration File
 
